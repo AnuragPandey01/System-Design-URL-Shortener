@@ -1,0 +1,15 @@
+# --- Python Artifacts ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+wheels/
+
+# --- uv / Virtual Environments ---
+.venv/
+
+# --- Environment Variables & Secrets ---
+.env
+.env.local

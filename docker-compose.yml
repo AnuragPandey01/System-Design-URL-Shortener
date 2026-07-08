@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: zookeeper:3.8
+    container_name: url_shortener_zk
+    restart: always
+    ports:
+      - "2181:2181"
+    environment:
+      ZOO_MY_ID: 1
+      ZOO_PORT: 2181
+      # In standalone mode, we don't need to define a cluster
+    volumes:
+      - zk_data:/data
+      - zk_datalog:/datalog
+
+volumes:
+  zk_data:
+  zk_datalog:
