@@ -1,9 +1,9 @@
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl
 
 class ShortenRequest(BaseModel):
-    long_url: str
+    long_url: HttpUrl
     expires_at: datetime
 
 
