@@ -15,6 +15,16 @@ services:
       - zk_data:/data
       - zk_datalog:/datalog
 
+  redis:
+    image: redis:alpine
+    container_name: url_shortener_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
 volumes:
   zk_data:
   zk_datalog:
+  redis_data:
