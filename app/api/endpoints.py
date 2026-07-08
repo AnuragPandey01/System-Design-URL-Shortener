@@ -6,10 +6,10 @@ from starlette.responses import RedirectResponse
 import redis
 import uuid
 
-from core.zookeeper import ZooKeeperTokenManager
-from db.session import get_db
-from models.url_models import URLs
-from schemas.url_schema import ShortenRequest, ShortenResponse
+from app.core.zookeeper import ZooKeeperTokenManager
+from app.db.session import get_db
+from app.models.url_models import URLs
+from app.schemas.url_schema import ShortenRequest, ShortenResponse
 import base62
 
 router = APIRouter(prefix="/api/v1")
