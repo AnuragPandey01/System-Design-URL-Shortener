@@ -37,23 +37,32 @@ When designing a URL shortener, the system characteristics dictate the architect
 
 ```mermaid
 graph TD
-    Client[Client / Browser] -->|POST /api/v1/shorten\nGET /api/v1/short_code| API[FastAPI Application Layer]
+    Client[Client / Browser] -->|POST /api/v1/shorten\nGET /api/v1/short_code| LB[Load Balancer]
     
-    subgraph Distributed Coordination & KGS
-        API <-->|Claim ID Batches\nAtomic Range Allocation| ZK[(Apache ZooKeeper)]
+    subgraph Stateless Worker Fleet
+        LB --> W1[FastAPI Worker 1]
+        LB --> W2[FastAPI Worker 2]
+        LB --> WN[FastAPI Worker N...]
+    end
+    
+    subgraph Shared Distributed KGS Layer
+        W1 & W2 & WN <-->|Claim ID Batches\nAtomic Range Allocation| ZK[(Shared Apache ZooKeeper Cluster)]
     end
 
-    subgraph Caching & Storage Layer
-        API <-->|Fast O1 Lookup\nNegative Caching & Jitter| Redis[(Redis Cache)]
-        API <-->|Persistent Storage\nSQLModel / PostgreSQL| DB[(PostgreSQL Database)]
+    subgraph Shared Caching Layer
+        W1 & W2 & WN <-->|Global O1 Lookup\nNegative Caching & Jitter| Redis[(Shared Centralized Redis / Cluster)]
+    end
+
+    subgraph Sharded Persistent Storage
+        W1 & W2 & WN <-->|Decoupled UUID v4 PKs\nHorizontal Read/Write Routing| DB[(Sharded PostgreSQL Database Cluster)]
     end
 ```
 
-The application is organized into decoupled tiers:
-* **API Layer (`app/api/endpoints.py`):** Stateless FastAPI workers serving HTTP endpoints (`/api/v1/shorten` and `/api/v1/{short_code}`).
-* **Distributed Key Generation Service (`app/core/zookeeper.py`):** Apache ZooKeeper manages range allocations to guarantee globally unique, sequential numeric IDs across distributed worker nodes without database coordination.
-* **Caching Layer (`app/core/redis.py`):** Redis 8 stores active `short_code -> long_url` mappings with jittered TTLs and negative cache sentinels (`404_NOT_FOUND`).
-* **Persistent Layer (`app/models/url_models.py` & PostgreSQL):** Relational storage mapping UUID v4 primary keys (`id`) to indexed short codes (`short_code`), URLs (`long_text`), and expiration timestamps (`expires_at`).
+The application is organized into decoupled, horizontally scalable tiers:
+* **Stateless API Worker Fleet (`app/api/endpoints.py`):** Stateless FastAPI containers serving HTTP endpoints (`/api/v1/shorten` and `/api/v1/{short_code}`). Because workers hold zero local state, the fleet can horizontally auto-scale from 2 pods to hundreds of pods during traffic spikes in seconds.
+* **Shared Key Generation Service (`app/core/zookeeper.py`):** A centralized Apache ZooKeeper cluster coordinates range allocations globally. Every worker node connects to this shared pool to claim unique, sequential numeric ID batches ($1,000$ IDs per claim), guaranteeing zero collisions across the distributed cluster without database locking.
+* **Shared Centralized Caching Layer (`app/core/redis.py`):** All worker nodes connect to a **Shared Redis instance (or Redis Cluster/Sentinel)**. This shared tier guarantees that when Worker #1 takes a cache miss on a popular link and populates Redis, or caches a `"404_NOT_FOUND"` negative sentinel during a DoS attack, **all other worker nodes globally receive instant $O(1)$ cache hits or negative blocks** without redundant database queries or duplicate RAM usage.
+* **Sharded Persistent Layer (`app/models/url_models.py` & PostgreSQL):** Relational storage mapping **UUID v4 primary keys (`id`)** to indexed short codes (`short_code`), original URLs (`long_text`), and expiration timestamps (`expires_at`). By decoupling our relational primary key (`id: UUID v4`) from our public lookup index (`short_code: str`), the database layer can be **horizontally sharded across multiple PostgreSQL primary instances and read replicas** (`e.g., hash(id) % num_shards`) as storage volume and write queries scale.
 
 ---
 
@@ -77,8 +86,8 @@ To eliminate both collision checks and database write bottlenecks, I implemented
 ```mermaid
 sequenceDiagram
     autonumber
-    participant App as FastAPI Worker Node
-    participant ZK as ZooKeeper (/url_shortener/counter)
+    participant App as FastAPI Worker Node (1 of N)
+    participant ZK as Shared ZooKeeper Cluster (/url_shortener/counter)
     
     Note over App: Worker starts with empty local range (current_id = 0)
     App->>ZK: Atomic Counter Increment (zk_counter += 1)
@@ -200,6 +209,24 @@ If Redis dies, `redis_safe_get()` returns `None`. The request seamlessly falls b
 
 ---
 
+### 🚀 TODO / Architectural Roadmap: L1 + L2 Multi-Level Caching (Absorbing Ultra-Hot Viral Traffic)
+
+When a short code achieves extreme virality (e.g., $50,000+\text{ req/sec}$ for a single breaking news link), querying even a **Shared Redis Cluster (L2 Cache)** over TCP for every single redirect can saturate network interface cards (NICs) across the worker fleet.
+
+To eliminate TCP overhead on ultra-hot links, the next architectural milestone is **Multi-Level Caching (L1 Local RAM + L2 Shared Redis)**:
+1. **L1 Local In-Memory LRU Cache (`cachetools.TTLCache` inside Worker RAM):** A tiny, bounded LRU cache (top $1,000$ keys) stored inside each FastAPI worker pod with an ultra-short TTL of **5 to 15 seconds**.
+2. **L2 Shared Distributed Cache (Redis Cluster):** Our primary shared cache tier holding tens of millions of active keys with a **24-hour + Jitter** TTL.
+3. **L3 Persistent Storage (Sharded PostgreSQL Cluster):** The source of truth.
+
+**Planned Request Lifecycle Flow:**
+* `GET /{short_code}` $\rightarrow$ Check **L1 Worker RAM** ($<0.01\text{ ms}$, zero network I/O).
+* On L1 Miss $\rightarrow$ Check **L2 Shared Redis Pool** ($\sim 0.5\text{ ms}$ TCP lookup).
+* On L2 Miss $\rightarrow$ Query **Sharded PostgreSQL DB** ($\sim 5\text{ ms}$) $\rightarrow$ Populate L2 Redis $\rightarrow$ Populate L1 Worker RAM.
+
+This two-tier caching strategy guarantees that ordinary traffic shares the centralized L2 Redis pool (preventing RAM waste across workers), while extreme viral bursts ($>99\%$ hit rate on top $0.01\%$ keys) are absorbed instantly by local L1 worker RAM!
+
+---
+
 ## 5. Database Design & Timezone Normalization
 
 The persistence layer uses **SQLModel** (built on top of SQLAlchemy and Pydantic) to map our schema strictly ([app/models/url_models.py](file:///home/anuragpandey/Projects/url-shortener/app/models/url_models.py)):
@@ -227,17 +254,20 @@ class URLs(SQLModel, table=True):
 
 ```mermaid
 graph TD
-    Client[Client Request:<br/>long_url + expires_at] --> A[POST /api/v1/shorten]
+    Client[Client Request:<br/>long_url + expires_at] --> LB[Load Balancer]
+    LB --> A[FastAPI Worker Pod]
     A --> B[zk_manager.get_next_id]
     
-    subgraph KGS Memory Range
+    subgraph Shared KGS / Local Batch Pool
+        B -->|If local batch empty, fetch from Shared ZK Cluster| ZK[(Shared ZooKeeper Cluster)]
+        ZK -->|Assign 1,000 ID Batch| B
         B -->|Assigned ID from local memory pool| C[Numeric ID e.g. 1000]
     end
     
     C --> D[base62.encode numeric_id]
     D --> E[Generate Short Code e.g. 'qG']
     E --> F[Construct SQLModel entry with UUID v4]
-    F --> G[Commit to PostgreSQL DB]
+    F --> G[Commit to Sharded PostgreSQL DB Cluster]
     G --> H[Return HTTP 201 Created:<br/>short_url = base_url / short_code]
 ```
 
@@ -245,22 +275,27 @@ graph TD
 
 ```mermaid
 graph TD
-    Client[Browser GET /api/v1/short_code] --> A{len > 8 chars?}
-    A -->|Yes| B[Return HTTP 404 Not Found<br/>Zero DB/Redis I/O]
-    A -->|No| C[redis_safe_get short_code]
+    Client[Browser GET /api/v1/short_code] --> LB[Load Balancer]
+    LB --> A[FastAPI Worker Pod]
     
-    C -->|Found & == 404_NOT_FOUND| D[Return HTTP 404 Not Found<br/>Negative Cache Hit]
-    C -->|Found & Valid URL| E[Return HTTP 302 Found<br/>Redirect to long_text]
+    A --> B{len > 8 chars?}
+    B -->|Yes| C[Return HTTP 404 Not Found<br/>Zero DB/Redis I/O]
+    B -->|No| D[Check L1 Local RAM LRU Cache<br/>TODO Roadmap: < 0.01ms hit]
     
-    C -->|Cache Miss / None| F[SELECT * FROM urls<br/>WHERE short_code = ?]
-    F --> G{Entry exists &<br/>expires_at > UTC now?}
+    D -->|L1 Miss / Not Enabled Yet| E[redis_safe_get short_code<br/>from Shared Redis Cluster]
     
-    G -->|No / Expired| H[redis_safe_set 404_NOT_FOUND<br/>TTL = 300s Negative Cache]
-    H --> I[Return HTTP 404 Not Found]
+    E -->|Found & == 404_NOT_FOUND| F[Return HTTP 404 Not Found<br/>Shared Negative Cache Hit]
+    E -->|Found & Valid URL| G[Return HTTP 302 Found<br/>Redirect to long_text]
     
-    G -->|Yes / Valid Entry| J[Calculate TTL = min remaining_seconds,<br/>86400 + randint 0..3600 Jitter]
-    J --> K[redis_safe_set short_code, long_text, ex=ttl]
-    K --> L[Return HTTP 302 Found<br/>Redirect to long_text]
+    E -->|Cache Miss / None| H[SELECT * FROM urls WHERE short_code = ?<br/>Query Sharded PostgreSQL DB Cluster]
+    H --> I{Entry exists &<br/>expires_at > UTC now?}
+    
+    I -->|No / Expired| J[redis_safe_set 404_NOT_FOUND<br/>Shared Negative Cache TTL = 300s]
+    J --> K[Return HTTP 404 Not Found]
+    
+    I -->|Yes / Valid Entry| L[Calculate TTL = min remaining_seconds,<br/>86400 + randint 0..3600 Jitter]
+    L --> M[redis_safe_set short_code, long_text, ex=ttl<br/>Populate Shared Redis Cluster]
+    M --> N[Return HTTP 302 Found<br/>Redirect to long_text]
 ```
 
 ---
