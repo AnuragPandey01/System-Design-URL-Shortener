@@ -37,24 +37,20 @@ When designing a URL shortener, the system characteristics dictate the architect
 
 ```mermaid
 graph TD
-    Client[Client / Browser] -->|POST /api/v1/shorten\nGET /api/v1/short_code| LB[Load Balancer]
+    Client[Client / Browser] -->|HTTP Requests| LB[Load Balancer]
     
     subgraph Stateless Worker Fleet
-        LB --> W1[FastAPI Worker 1]
-        LB --> W2[FastAPI Worker 2]
-        LB --> WN[FastAPI Worker N...]
+        W1[FastAPI Worker 1]
+        W2[FastAPI Worker 2]
+        WN[FastAPI Worker N...]
     end
     
-    subgraph Shared Distributed KGS Layer
-        W1 & W2 & WN <-->|Claim ID Batches\nAtomic Range Allocation| ZK[(Shared Apache ZooKeeper Cluster)]
-    end
-
-    subgraph Shared Caching Layer
-        W1 & W2 & WN <-->|Global O1 Lookup\nNegative Caching & Jitter| Redis[(Shared Centralized Redis / Cluster)]
-    end
-
-    subgraph Sharded Persistent Storage
-        W1 & W2 & WN <-->|Decoupled UUID v4 PKs\nHorizontal Read/Write Routing| DB[(Sharded PostgreSQL Database Cluster)]
+    LB --> W1 & W2 & WN
+    
+    subgraph Shared Distributed Infrastructure
+        W1 & W2 & WN <--> ZK[(Apache ZooKeeper Cluster)]
+        W1 & W2 & WN <--> Redis[(Shared Redis Cluster)]
+        W1 & W2 & WN <--> DB[(Sharded PostgreSQL Cluster)]
     end
 ```
 
@@ -259,15 +255,15 @@ graph TD
     A --> B[zk_manager.get_next_id]
     
     subgraph Shared KGS / Local Batch Pool
-        B -->|If local batch empty, fetch from Shared ZK Cluster| ZK[(Shared ZooKeeper Cluster)]
+        B -->|If batch empty| ZK[(Shared ZooKeeper Cluster)]
         ZK -->|Assign 1,000 ID Batch| B
-        B -->|Assigned ID from local memory pool| C[Numeric ID e.g. 1000]
+        B -->|Assign ID from local memory| C[Numeric ID e.g. 1000]
     end
     
     C --> D[base62.encode numeric_id]
     D --> E[Generate Short Code e.g. 'qG']
     E --> F[Construct SQLModel entry with UUID v4]
-    F --> G[Commit to Sharded PostgreSQL DB Cluster]
+    F --> G[Commit to Sharded PostgreSQL Cluster]
     G --> H[Return HTTP 201 Created:<br/>short_url = base_url / short_code]
 ```
 
@@ -280,21 +276,21 @@ graph TD
     
     A --> B{len > 8 chars?}
     B -->|Yes| C[Return HTTP 404 Not Found<br/>Zero DB/Redis I/O]
-    B -->|No| D[Check L1 Local RAM LRU Cache<br/>TODO Roadmap: < 0.01ms hit]
+    B -->|No| D[Check L1 Local RAM Cache<br/>TODO Roadmap]
     
-    D -->|L1 Miss / Not Enabled Yet| E[redis_safe_get short_code<br/>from Shared Redis Cluster]
+    D -->|L1 Miss / Not Enabled| E[redis_safe_get short_code<br/>Shared Redis Cluster]
     
-    E -->|Found & == 404_NOT_FOUND| F[Return HTTP 404 Not Found<br/>Shared Negative Cache Hit]
-    E -->|Found & Valid URL| G[Return HTTP 302 Found<br/>Redirect to long_text]
+    E -->|Found == 404_NOT_FOUND| F[Return HTTP 404 Not Found<br/>Negative Cache Hit]
+    E -->|Found Valid URL| G[Return HTTP 302 Found<br/>Redirect to long_text]
     
-    E -->|Cache Miss / None| H[SELECT * FROM urls WHERE short_code = ?<br/>Query Sharded PostgreSQL DB Cluster]
+    E -->|Cache Miss / None| H[SELECT * FROM urls<br/>Sharded PostgreSQL Cluster]
     H --> I{Entry exists &<br/>expires_at > UTC now?}
     
-    I -->|No / Expired| J[redis_safe_set 404_NOT_FOUND<br/>Shared Negative Cache TTL = 300s]
+    I -->|No / Expired| J[redis_safe_set 404_NOT_FOUND<br/>Negative Cache TTL = 300s]
     J --> K[Return HTTP 404 Not Found]
     
-    I -->|Yes / Valid Entry| L[Calculate TTL = min remaining_seconds,<br/>86400 + randint 0..3600 Jitter]
-    L --> M[redis_safe_set short_code, long_text, ex=ttl<br/>Populate Shared Redis Cluster]
+    I -->|Yes / Valid Entry| L[Calculate TTL with Jitter]
+    L --> M[redis_safe_set short_code, long_text<br/>Populate Shared Redis Cluster]
     M --> N[Return HTTP 302 Found<br/>Redirect to long_text]
 ```
 
